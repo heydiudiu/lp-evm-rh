@@ -835,16 +835,42 @@ async function readPositionEvents(rpc, poolId, fromBlock, ids) {
     }]));
   } catch (e) {
     // Оживлённый пул может не влезть в один ответ — идём окнами.
+    //
+    // ЗДЕСЬ СТОЯЛ break, И ОН ТЕРЯЛ ЗАКРЫТИЯ ПОЗИЦИЙ.
+    //
+    // 11.09.2026 в отчёте по сделкам четыре позиции получили «закрытие не
+    // нашёл» — при том что в цепочке оно есть, я потом нашёл его руками.
+    // Причина: на пуле MARIO узел отвечал «log query timed out» на окне в
+    // пятьдесят тысяч блоков, первая же такая неудача обрывала перебор, и
+    // всё, что лежало ДАЛЬШЕ, просто не читалось. Молча.
+    //
+    // Правильное поведение: неудачное окно уменьшить и повторить, а если и
+    // это не вышло — пропустить ЕГО, но продолжить остальные, и сказать
+    // вслух, сколько окон не прочиталось. «Не нашёл» и «не смог прочитать»
+    // это разные ответы, и путать их на деньгах нельзя.
     const latest = Number(BigInt(await rpc('eth_blockNumber', [])));
-    for (let st = fromBlock; st <= latest; st += 50000) {
+    let missed = 0;
+    const window = async (from, to, depth) => {
       try {
         take(await rpc('eth_getLogs', [{
-          fromBlock: '0x' + st.toString(16),
-          toBlock: '0x' + Math.min(latest, st + 49999).toString(16),
+          fromBlock: '0x' + from.toString(16), toBlock: '0x' + to.toString(16),
           address: RH.poolManager, topics: [MODIFY_TOPIC, poolId],
         }]));
-      } catch (e2) { break; }
+      } catch (e2) {
+        // Делим пополам до четырёх раз: узел обычно давится размером ответа,
+        // а не самим запросом.
+        if (depth >= 4 || to - from < 200) { missed++; return; }
+        const mid = Math.floor((from + to) / 2);
+        await window(from, mid, depth + 1);
+        await window(mid + 1, to, depth + 1);
+      }
+    };
+    for (let st = fromBlock; st <= latest; st += 50000) {
+      await window(st, Math.min(latest, st + 49999), 0);
     }
+    // Счётчик вешаем СВОЙСТВОМ, а не записью в карте: вызывающий перебирает
+    // её ключи как номера позиций, и служебная запись стала бы «позицией».
+    if (missed) byId.missed = missed;
   }
   for (const v of byId.values()) v.sort((a, b) => a.block - b.block);
   return byId;

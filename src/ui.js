@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '5.2.1';
+  const VERSION = '5.2.2';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -2206,7 +2206,29 @@
         line += ` | вносил ${rec.amountIn.toFixed(4)} → ИТОГ ${pnl >= 0 ? '+' : ''}` +
                 `${pnl.toFixed(4)} (${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)`;
         if (mins != null) line += ` за ${mins < 60 ? mins.toFixed(0) + ' мин' : (mins/60).toFixed(1) + ' ч'}`;
-        ledger.put(String(tokenId), { closed: Date.now(), got, pnl });
+        // ЧТО ЕЩЁ НУЖНО КАРТОЧКЕ: границы диапазона и цена, на которой
+        // вышли. Автор попросил, чтобы карточка в терминале выглядела так
+        // же, как те, что я присылаю ему в Telegram, а там это есть.
+        // Берём с цепочки: границы лежат в самой позиции, и после закрытия
+        // NFT никуда не девается.
+        let lo = null, hi = null, exitPx = null;
+        try {
+          const d0 = await tokenDecimals(key.currency0);
+          const d1 = await tokenDecimals(key.currency1);
+          const shown = (tick) => {
+            const raw = Math.pow(1.0001, tick) * Math.pow(10, d0 - d1);
+            if (!isFinite(raw) || raw <= 0) return null;
+            return stableIsFirst ? 1 / raw : raw;
+          };
+          const info = await C.readPositionPool(state.rpc, tokenId);
+          const t = C.unpackTicks(info.info);
+          const a = shown(t.tickLower), b = shown(t.tickUpper);
+          if (a && b) { lo = Math.min(a, b); hi = Math.max(a, b); }
+          if (price) exitPx = stableIsFirst ? 1 / price : price;
+        } catch (e) { /* без границ карточка обойдётся */ }
+        ledger.put(String(tokenId), {
+          closed: Date.now(), got, pnl, symStable: symQuote, lo, hi, exitPx,
+        });
         // Одна карточка сразу после закрытия — как просил автор.
         // Не копятся: старая убирается перед показом новой.
         showCard(String(tokenId), { ...(ledger.get(String(tokenId)) || {}) });
@@ -2328,6 +2350,13 @@
       let events;
       try { events = await C.readPositionEvents(logsRpc(), pid, g.from, g.items.map(x => x.id)); }
       catch (e) { continue; }
+      // Узел мог не отдать часть журнала. Молчать об этом нельзя: тогда
+      // неполная история выглядит как полная, и сделка без выхода — как
+      // сделка, которой не было.
+      if (events.missed) {
+        log(`история ${s0}/${s1}: ${events.missed} кусок(ов) журнала узел не отдал — ` +
+            `часть сделок может не показаться, обнови ещё раз`, 'warn');
+      }
 
       // Одна транзакция может закрыть несколько позиций сразу. Тогда её
       // движения относятся ко всем сразу, и приписать их одной — соврать.
@@ -2443,65 +2472,156 @@
   //
   // Показывается после закрытия и по кнопке в истории. Не копится: одна
   // карточка на экране, закрывается щелчком. Скачивается картинкой.
-  function drawCard(rec) {
-    const W = 900, H = 520;
+  // КАРТОЧКА СДЕЛКИ.
+  //
+  // Приведена к тому виду, который автор видит в Telegram и который ему
+  // больше нравится: пара и номер сверху, крупный итог в стейбле, процент
+  // от вложенного, строки «внёс / вернул / диапазон / цена на выходе» и
+  // полоса, показывающая, где цена оказалась относительно диапазона.
+  // Рисуем на холсте, а не разметкой: карточку надо уметь скачать картинкой.
+  function drawCard(rec, id) {
+    const W = 900, PAD = 52;
+    const win = (rec.pnl ?? 0) >= 0;
+    const st = rec.symStable || '';
+    const num = (v, d = 2) => (v == null || !isFinite(v)) ? '—' : v.toFixed(d);
+    const px = (v) => (v == null || !isFinite(v)) ? '—'
+      : (v >= 1 ? v.toFixed(4) : v.toPrecision(4));
+
+    // Строки таблицы собираем заранее: от их числа зависит высота холста.
+    const rows = [];
+    if (rec.amountIn != null) {
+      const inTxt = rec.amountInToken != null && rec.depIsStable === false
+        ? `${num(Number(rec.amountInToken))} ${rec.symIn || ''} (≈${num(rec.amountIn)} ${st})`
+        : `${num(rec.amountIn)} ${st}`;
+      rows.push(['внёс', inTxt, null]);
+    }
+    rows.push(['вернул', `${num(rec.got)} ${st}`, null]);
+    if (rec.takenOut > 0) rows.push(['вынуто раньше', `${num(rec.takenOut)} ${st}`, '#81d8ad']);
+    const hasBand = rec.lo != null && rec.hi != null;
+    if (hasBand) rows.push(['диапазон', `${px(rec.lo)} — ${px(rec.hi)}`, null]);
+    let inBand = null;
+    if (hasBand && rec.exitPx != null) {
+      inBand = rec.exitPx > rec.lo && rec.exitPx < rec.hi;
+      rows.push(['цена на выходе', px(rec.exitPx), inBand ? '#81d8ad' : '#e2b87b']);
+    }
+
+    // Высота считается по содержимому. Первый вариант был ниже на сорок
+    // точек, и подписи полосы диапазона наезжали на подвал — видно сразу,
+    // но только если нарисовать и посмотреть, что я и сделал.
+    const H = 236 + rows.length * 46 + (hasBand ? 96 : 44) + 34;
     const cv = document.createElement('canvas');
     cv.width = W; cv.height = H;
     const g = cv.getContext('2d');
-    g.fillStyle = '#101216'; g.fillRect(0, 0, W, H);
-    // мягкое свечение в углу, чтобы не выглядело как таблица
-    const glow = g.createRadialGradient(W * 0.78, H * 0.18, 10, W * 0.78, H * 0.18, 420);
-    const win = (rec.pnl ?? 0) >= 0;
-    glow.addColorStop(0, win ? 'rgba(129,216,173,.16)' : 'rgba(237,147,147,.14)');
+    g.fillStyle = '#181b20'; g.fillRect(0, 0, W, H);
+    const glow = g.createRadialGradient(W * 0.8, 90, 10, W * 0.8, 90, 460);
+    glow.addColorStop(0, win ? 'rgba(129,216,173,.13)' : 'rgba(237,147,147,.12)');
     glow.addColorStop(1, 'rgba(0,0,0,0)');
     g.fillStyle = glow; g.fillRect(0, 0, W, H);
 
-    g.fillStyle = '#969eab';
-    g.font = '600 22px ui-sans-serif,system-ui,sans-serif';
-    const head = 'Uniswap V4';
-    g.fillText(head, 52, 74);
-    if (rec.fee != null) {
-      // Плашку ставим ПОСЛЕ надписи, отмерив её ширину. На глаз она налезала
-      // на текст: «Uniswap V4» шире, чем я предположил.
-      const x = 52 + g.measureText(head).width + 16;
-      const t = (rec.fee / 10000).toFixed(2) + '%';
-      g.font = '600 17px ui-sans-serif,system-ui,sans-serif';
-      const w = g.measureText(t).width;
-      g.fillStyle = '#20242b';
-      g.fillRect(x, 52, w + 24, 30);
-      g.fillStyle = '#edf0f4';
-      g.fillText(t, x + 12, 74);
+    // ── шапка
+    g.fillStyle = '#edf0f4';
+    g.font = '600 40px Inter,ui-sans-serif,system-ui,sans-serif';
+    g.fillText(rec.pair || 'позиция', PAD, 74);
+    g.fillStyle = '#788291';
+    g.font = '400 19px Inter,ui-sans-serif,system-ui,sans-serif';
+    const mins = rec.tEntry && rec.closed ? (rec.closed - rec.tEntry) / 60000 : null;
+    const held = mins == null ? '' : ' · ' + (mins < 1 ? Math.max(1, Math.round(mins * 60)) + ' с'
+      : mins < 60 ? Math.round(mins) + ' мин' : (mins / 60).toFixed(1) + ' ч') + ' в пуле';
+    g.fillText(`позиция #${id || ''}${held}`, PAD, 104);
+
+    // плашка состояния справа
+    {
+      const t = 'ЗАКРЫТА';
+      g.font = '600 15px Inter,ui-sans-serif,system-ui,sans-serif';
+      const w = g.measureText(t).width + 28;
+      g.strokeStyle = 'rgba(255,255,255,.14)'; g.lineWidth = 1;
+      g.beginPath();
+      if (g.roundRect) g.roundRect(W - PAD - w, 50, w, 32, 16);
+      else g.rect(W - PAD - w, 50, w, 32);
+      g.stroke();
+      g.fillStyle = '#969eab';
+      g.fillText(t, W - PAD - w + 14, 71);
     }
 
-    g.fillStyle = '#ffffff';
-    g.font = '700 62px ui-sans-serif,system-ui,sans-serif';
-    g.fillText(rec.pair || 'позиция', 52, 168);
-
-    const pct = rec.amountIn ? (rec.pnl / rec.amountIn) * 100 : 0;
-    g.fillStyle = '#969eab';
-    g.font = '600 30px ui-sans-serif,system-ui,sans-serif';
-    g.fillText(win ? 'Прибыль' : 'Убыток', 52, 300);
-    g.textAlign = 'right';
+    // ── крупный итог
     g.fillStyle = win ? '#81d8ad' : '#ed9393';
-    g.font = '700 40px ui-monospace,Menlo,monospace';
-    g.fillText((pct >= 0 ? '+' : '') + pct.toFixed(2) + '%', W - 52, 300);
-    g.textAlign = 'left';
-    g.font = '700 110px ui-sans-serif,system-ui,sans-serif';
-    g.fillText((win ? '+$' : '−$') + Math.abs(rec.pnl ?? 0).toFixed(2), 52, 400);
+    g.font = '600 78px ui-monospace,"SF Mono",Menlo,Consolas,monospace';
+    const big = (win ? '+' : '−') + Math.abs(rec.pnl ?? 0).toFixed(2);
+    g.fillText(big, PAD, 196);
+    const bw = g.measureText(big).width;
+    g.fillStyle = '#969eab';
+    g.font = '500 26px Inter,ui-sans-serif,system-ui,sans-serif';
+    g.fillText(st, PAD + bw + 18, 196);
+    const pct = rec.amountIn ? (rec.pnl / rec.amountIn) * 100 : null;
+    g.fillStyle = win ? '#81d8ad' : '#ed9393';
+    g.font = '400 20px Inter,ui-sans-serif,system-ui,sans-serif';
+    if (pct != null) {
+      g.fillText(`${pct >= 0 ? '+' : '−'}${Math.abs(pct).toFixed(1)}% от вложенного`,
+                 PAD, 230);
+    }
 
+    // ── строки
+    let y = 272;
+    g.font = '400 20px Inter,ui-sans-serif,system-ui,sans-serif';
+    for (const [k, v, color] of rows) {
+      g.fillStyle = '#969eab';
+      g.textAlign = 'left';
+      g.fillText(k, PAD, y);
+      g.fillStyle = color || '#edf0f4';
+      g.font = '500 20px ui-monospace,"SF Mono",Menlo,Consolas,monospace';
+      g.textAlign = 'right';
+      g.fillText(v, W - PAD, y);
+      g.textAlign = 'left';
+      g.font = '400 20px Inter,ui-sans-serif,system-ui,sans-serif';
+      g.strokeStyle = 'rgba(255,255,255,.07)';
+      g.setLineDash([3, 4]); g.lineWidth = 1;
+      g.beginPath(); g.moveTo(PAD, y + 14.5); g.lineTo(W - PAD, y + 14.5); g.stroke();
+      g.setLineDash([]);
+      y += 46;
+    }
+
+    // ── полоса диапазона
+    if (hasBand) {
+      const bx = PAD, bw2 = W - PAD * 2, by = y + 6;
+      g.fillStyle = '#12151a';
+      g.beginPath();
+      if (g.roundRect) g.roundRect(bx, by, bw2, 10, 5); else g.rect(bx, by, bw2, 10);
+      g.fill();
+      let pos = null;
+      if (rec.exitPx != null) {
+        pos = Math.max(0, Math.min(1, (rec.exitPx - rec.lo) / (rec.hi - rec.lo)));
+        const grad = g.createLinearGradient(bx, 0, bx + bw2 * pos, 0);
+        grad.addColorStop(0, 'rgba(129,216,173,.25)');
+        grad.addColorStop(1, 'rgba(129,216,173,.6)');
+        g.fillStyle = grad;
+        g.beginPath();
+        if (g.roundRect) g.roundRect(bx, by, Math.max(6, bw2 * pos), 10, 5);
+        else g.rect(bx, by, Math.max(6, bw2 * pos), 10);
+        g.fill();
+        g.fillStyle = '#e2b87b';
+        g.beginPath(); g.arc(bx + bw2 * pos, by + 5, 8, 0, Math.PI * 2); g.fill();
+      }
+      g.font = '400 15px Inter,ui-sans-serif,system-ui,sans-serif';
+      g.fillStyle = '#788291';
+      g.fillText(px(rec.lo), bx, by + 34);
+      g.textAlign = 'right';
+      g.fillText(px(rec.hi), bx + bw2, by + 34);
+      g.textAlign = 'center';
+      g.fillStyle = inBand === null ? '#788291' : (inBand ? '#81d8ad' : '#e2b87b');
+      g.fillText(inBand === null ? 'цена на выходе не прочиталась'
+        : (inBand ? 'цена внутри диапазона' : 'цена вне диапазона'), bx + bw2 / 2, by + 34);
+      g.textAlign = 'left';
+      y = by + 54;
+    }
+
+    // ── подвал
     g.fillStyle = '#55677a';
-    g.font = '400 20px ui-sans-serif,system-ui,sans-serif';
-    const mins = rec.tEntry && rec.closed
-      ? Math.max(1, Math.round((rec.closed - rec.tEntry) / 60000)) + ' мин в позиции' : '';
-    // Подпись показывает вход так, как он БЫЛ: если заходили монетой —
-    // её количество и рядом во что это превратилось по цене входа.
-    const inTxt = rec.amountInToken != null && rec.depIsStable === false
-      ? `${Number(rec.amountInToken).toLocaleString('ru', { maximumFractionDigits: 2 })} ` +
-        `${rec.symIn || ''} (≈${Number(rec.amountIn || 0).toFixed(2)})`
-      : `${Number(rec.amountIn || 0).toFixed(2)}`;
-    g.fillText(`${inTxt} → ${(rec.got ?? 0).toFixed(2)}   ${mins}`, 52, 452);
+    g.font = '400 16px Inter,ui-sans-serif,system-ui,sans-serif';
+    g.fillText('Uniswap V4' + (rec.fee != null && rec.fee < 0x800000
+      ? ' · ' + (rec.fee / 10000).toFixed(2) + '%' : ''), PAD, H - 24);
     g.textAlign = 'right';
-    g.fillText('LP EVM RH', W - 52, 452);
+    g.fillText(C.RH.label + ' · LP терминал', W - PAD, H - 24);
+    g.textAlign = 'left';
     return cv;
   }
 
@@ -2512,7 +2632,7 @@
     box.style.cssText = 'position:fixed;inset:0;background:rgba(3,6,10,.82);' +
       'display:flex;align-items:center;justify-content:center;z-index:9999;' +
       'flex-direction:column;gap:14px';
-    const cv = drawCard(rec);
+    const cv = drawCard(rec, id);
     cv.style.cssText = 'max-width:min(92vw,900px);width:100%;height:auto;' +
       'border-radius:16px;box-shadow:0 20px 60px rgba(0,0,0,.6)';
     const row = document.createElement('div');
